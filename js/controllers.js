@@ -37,8 +37,22 @@ const groundCollider = { type: 'ground' };
 
 const CAR_DRIVE = {
   speed: 23.5, boostSpeed: 36, reverseSpeed: 10.5, acceleration: 14, boostAcceleration: 21,
-  rolling: 0.12, drag: 0.0004, brake: 9
+  rolling: 0.12, drag: 0.0004, brake: 9,
+  mass: 1000,
+  inertia: (1000 * (4 ** 2 + 2 ** 2)) / 12,
+  rollingResistance: 32.5,
+  lateralResistance: 1100,
+  handbrakeGrip: 0.15,
+  handbrakeRollingMultiplier: 8,
+  gripRecoveryTime: 0.15,
+  handbrakeStrength: 0.75
 };
+const CAR_TYRES = [
+  { x: 0.7, z: 1.35, steered: true },
+  { x: -0.7, z: 1.35, steered: true },
+  { x: 0.7, z: -1.35, steered: false },
+  { x: -0.7, z: -1.35, steered: false }
+];
 const BICYCLE_DRIVE = {
   speed: 12.8, boostSpeed: 19, reverseSpeed: 4.5, acceleration: 9, boostAcceleration: 13.5,
   rolling: 0.05, drag: 0.002, brake: 7.5 // Backward input is scaled to 0.6, giving 4.5 m/s² braking.
@@ -129,7 +143,8 @@ class ThirdPersonControllerManager {
       right: false,
       up: false,
       down: false,
-      boost: false
+      boost: false,
+      handbrake: false
     };
 
     this.entities = {
@@ -181,22 +196,32 @@ class ThirdPersonControllerManager {
       right: ['KeyD', 'ArrowRight'],
       up: ['Space', 'KeyE'],
       down: ['KeyQ', 'KeyC'],
-      boost: ['ShiftLeft', 'ShiftRight']
+      boost: ['ShiftLeft', 'ShiftRight'],
+      handbrake: ['Space']
     };
-    const actionsByCode = new Map(Object.entries(bindings).flatMap(([action, codes]) => codes.map((code) => [code, action])));
+    const actionsByCode = new Map();
+    for (const [action, codes] of Object.entries(bindings)) {
+      this.keys[action] ??= false;
+      for (const code of codes) {
+        if (!actionsByCode.has(code)) actionsByCode.set(code, []);
+        actionsByCode.get(code).push(action);
+      }
+    }
     this._pressedCodes = new Set();
     this._keyboardKeys = {};
     this._touchKeys = {};
     this._gamepadKeys = {};
 
     const onKey = (e, isDown) => {
-      const action = actionsByCode.get(e.code);
-      if (!action || (isDown && isTypingInField(e))) return;
+      const actions = actionsByCode.get(e.code);
+      if (!actions || (isDown && isTypingInField(e))) return;
       if (isDown) this._pressedCodes.add(e.code);
       else this._pressedCodes.delete(e.code);
       // Releasing one binding must not cancel another key held for the same action.
-      this._keyboardKeys[action] = bindings[action].some((code) => this._pressedCodes.has(code));
-      this._blendInput(action);
+      for (const action of actions) {
+        this._keyboardKeys[action] = bindings[action].some((code) => this._pressedCodes.has(code));
+        this._blendInput(action);
+      }
     };
 
     window.addEventListener('keydown', (e) => onKey(e, true));
@@ -279,7 +304,7 @@ class ThirdPersonControllerManager {
       ent.crowd.add(ent.rig, 0);
       ent.crowd.end();
     } else if (this.activeMode === 'car') {
-      ent.vx = ent.vz = ent.angularVel = ent.steerAngle = 0;
+      ent.vx = ent.vz = ent.angularVel = ent.steerAngle = ent.rearGripLoss = 0;
       ent.pitchVel = ent.rollVel = ent.heaveY = ent.heaveVel = 0;
       ent.chassisPivot.rotation.x = ent.chassisPivot.rotation.z = 0;
       ent.chassisPivot.position.y = 0;
@@ -514,6 +539,7 @@ class ThirdPersonControllerManager {
       vx: 0,
       vz: 0,
       angularVel: 0,
+      rearGripLoss: 0,
       pitchVel: 0,
       rollVel: 0,
       heaveY: 0,
@@ -1087,10 +1113,22 @@ class ThirdPersonControllerManager {
     if (this.keys.forward) throttle = this.keys.forward;
     else if (this.keys.backward) throttle = -this.keys.backward;
 
+    const handbrake = Number(this.keys.handbrake) || 0;
+    const handbrakeStrength = CAR_DRIVE.handbrakeStrength * handbrake;
+    c.rearGripLoss = handbrake > 0
+      ? 1
+      : Math.max(0, (c.rearGripLoss || 0) - (CAR_DRIVE.gripRecoveryTime > 0 ? dt / CAR_DRIVE.gripRecoveryTime : 1));
+    const rearGripLoss = c.rearGripLoss;
+    const rearLateralScale = 1 - rearGripLoss * CAR_DRIVE.handbrakeStrength * (1 - CAR_DRIVE.handbrakeGrip);
+    const rearSlipFactor = 1 - rearLateralScale;
+
+    const sinH0 = Math.sin(c.heading), cosH0 = Math.cos(c.heading);
+    const preVx = sinH0 * c.speed + c.vx;
+    const preVz = cosH0 * c.speed + c.vz;
+
     const braking = c.speed * throttle < 0;
     const previousSpeed = c.speed;
     c.speed = driveSpeed(c.speed, throttle, this.keys.boost, dt, CAR_DRIVE);
-    const acceleration = dt > 0 ? (c.speed - previousSpeed) / dt : 0;
 
     let steerInput = 0;
     if (this.keys.left) steerInput = this.keys.left;
@@ -1098,16 +1136,72 @@ class ThirdPersonControllerManager {
 
     c.steerAngle += (steerInput * 0.52 - c.steerAngle) * Math.min(1, dt * 10);
 
+    if (handbrake > 0 || rearGripLoss > 0) {
+      let rearRollingDecel = 0;
+      let totalTorque = 0;
+      const u0 = preVx * sinH0 + preVz * cosH0;
+      const v0 = preVx * cosH0 - preVz * sinH0;
+
+      for (const tyre of CAR_TYRES) {
+        const vtx = v0 + c.angularVel * tyre.z;
+        const vtz = u0 - c.angularVel * tyre.x;
+        const angle = tyre.steered ? c.steerAngle : 0;
+        const sinA = Math.sin(angle), cosA = Math.cos(angle);
+        const rollingSpeed = vtx * sinA + vtz * cosA;
+        const lateralSpeed = tyre.steered
+          ? vtx * cosA - u0 * sinA * rearSlipFactor
+          : vtx;
+
+        const tyreRollingResistance = !tyre.steered && handbrake > 0
+          ? CAR_DRIVE.rollingResistance * (1 + handbrakeStrength * (CAR_DRIVE.handbrakeRollingMultiplier - 1))
+          : CAR_DRIVE.rollingResistance;
+        const tyreLateralResistance = tyre.steered
+          ? CAR_DRIVE.lateralResistance
+          : CAR_DRIVE.lateralResistance * rearLateralScale;
+
+        const fRoll = -tyreRollingResistance * rollingSpeed;
+        const fLat = -tyreLateralResistance * lateralSpeed;
+        const fx = sinA * fRoll + cosA * fLat;
+        const fz = cosA * fRoll - sinA * fLat;
+
+        if (!tyre.steered && handbrake > 0) {
+          rearRollingDecel += Math.abs(fRoll) / CAR_DRIVE.mass;
+        }
+        totalTorque += tyre.z * fx - tyre.x * fz;
+      }
+
+      if (handbrake > 0 && c.speed !== 0) {
+        const hbDecel = rearRollingDecel + CAR_DRIVE.brake * 0.35 * handbrakeStrength;
+        c.speed = Math.sign(c.speed) * Math.max(0, Math.abs(c.speed) - hbDecel * dt);
+      }
+      c.angularVel += (totalTorque / CAR_DRIVE.inertia) * Math.min(dt, 0.1);
+    }
+
+    const acceleration = dt > 0 ? (c.speed - previousSpeed) / dt : 0;
+
+    let dHeading = 0;
     if (Math.abs(c.speed) > 0.2) {
       const dirSign = c.speed >= 0 ? 1 : -1;
       const speedFactor = Math.min(1.0, Math.abs(c.speed) / 8.0);
-      c.heading += c.steerAngle * 2.4 * speedFactor * dirSign * dt;
+      dHeading += c.steerAngle * 2.4 * speedFactor * dirSign * dt;
     }
 
-    // Integrate collision yaw spin & lateral tire slip velocity with asphalt grip damping
-    const tireGripDamp = Math.exp(-dt * 6.8);
-    c.heading += c.angularVel * dt;
-    c.angularVel *= Math.exp(-dt * 7.8);
+    // Integrate collision & handbrake yaw spin and lateral tire slip velocity with asphalt grip damping
+    const tireGripDamp = Math.exp(-dt * 6.8 * rearLateralScale);
+    dHeading += c.angularVel * dt;
+    c.heading += dHeading;
+    c.angularVel *= Math.exp(-dt * 7.8 * rearLateralScale);
+
+    if (rearSlipFactor > 0 && dHeading !== 0) {
+      const slipSpeed = c.speed * rearSlipFactor;
+      const keptSpeed = c.speed - slipSpeed;
+      const sinH1 = Math.sin(c.heading), cosH1 = Math.cos(c.heading);
+      const worldVx = sinH0 * slipSpeed + sinH1 * keptSpeed + c.vx;
+      const worldVz = cosH0 * slipSpeed + cosH1 * keptSpeed + c.vz;
+      c.speed = worldVx * sinH1 + worldVz * cosH1;
+      c.vx = worldVx - sinH1 * c.speed;
+      c.vz = worldVz - cosH1 * c.speed;
+    }
 
     const prevX = c.position.x;
     const prevZ = c.position.z;
@@ -1134,7 +1228,7 @@ class ThirdPersonControllerManager {
     c.chassisPivot.position.y = c.heaveY;
 
     if (c.carState) {
-      c.carState.value.x = braking || (c.speed === 0 && !throttle) ? 1 : 0;
+      c.carState.value.x = braking || handbrake > 0 || (c.speed === 0 && !throttle) ? 1 : 0;
     }
 
     const forwardDist = (c.position.x - prevX) * Math.sin(c.heading) + (c.position.z - prevZ) * Math.cos(c.heading);

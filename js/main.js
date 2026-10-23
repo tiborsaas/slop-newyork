@@ -165,18 +165,17 @@ async function initApp() {
   });
 
   // 5. TSL RenderPipeline with Half-Res Screen Space Reflections (SSRNode), Bloom & Filmic Toning
-  //    Fade out distant and matte surfaces so SSR spends its rays on visible glossy reflections.
+  //    SSR skips pixels with zero metalness, so fading it out with distance spares the far facades
   const scenePass = pass(scene, cameraSystem.camera);
   // The multisampled colour attachments (output, normal, metalRough) only need resolving, never storing: discarding
   // them spares the GPU writing 3 x 4 samples per pixel to memory every frame (transient, memoryless attachments where
   // the browser supports them). The multisampled depth stays stored: SSR reads it.
   scenePass.renderTarget.storeMultisampledColorBuffer = false;
   const ssrFade = smoothstep(360.0, 180.0, positionView.z.negate());
-  const maxSSRRoughness = 0.75;
   const sceneMRT = mrt({
     output: output,
     normal: normalView,
-    metalRough: vec2(roughness.lessThan(maxSSRRoughness).select(metalness.mul(ssrFade), 0), roughness)
+    metalRough: vec2(metalness.mul(ssrFade), roughness)
   });
   sceneMRT.setBlendMode('normal', new THREE.BlendMode(THREE.MaterialBlending));
   sceneMRT.setBlendMode('metalRough', new THREE.BlendMode(THREE.MaterialBlending));
@@ -196,16 +195,11 @@ async function initApp() {
   ssrPass.blurQuality = 1;
   ssrPass.maxDistance.value = 42;
   ssrPass.thickness.value = 0.85;
-  // Fewer coarse steps, then refine detected hits to keep reflection edges precise.
-  ssrPass.quality.value = 0.25;
-  ssrPass.binaryRefine = true;
+  ssrPass.quality.value = 0.35;
   ssrPass.intensity.value = 0.50;
   ssrPass.screenEdgeFadeBlack = true;
 
-  // Roughness mip blur must not spread reflections back onto matte or nonreflective surfaces.
-  const reflectionMask = scenePassMetalRough.r.greaterThan(0).select(smoothstep(maxSSRRoughness, 0.55, scenePassMetalRough.g), 0);
-  const reflections = ssrPass.mul(reflectionMask);
-  const colorGrade = createPostProcessing(renderer, scenePassColor, reflections);
+  const colorGrade = createPostProcessing(renderer, scenePassColor, ssrPass);
   const renderPipeline = new THREE.RenderPipeline(renderer, colorGrade.outputNode);
 
   // 6. Wire UI Controls (Strictly using safe DOM APIs: textContent, classList, addEventListener)
@@ -238,7 +232,7 @@ async function initApp() {
   // Keyboard guide for each mode: [keys, action]
   const controlHints = {
     person: [[['W', 'S'], 'Walk'], [['A', 'D'], 'Turn'], [['Shift'], 'Sprint'], [['Space'], 'Jump'], [['Drag'], 'Orbit']],
-    car: [[['W', 'S'], 'Drive / Reverse'], [['A', 'D'], 'Steer'], [['Shift'], 'Boost'], [['B'], 'Horn'], [['Drag'], 'Orbit']],
+    car: [[['W', 'S'], 'Drive / Reverse'], [['A', 'D'], 'Steer'], [['Space'], 'Handbrake'], [['Shift'], 'Boost'], [['B'], 'Horn'], [['Drag'], 'Orbit']],
     cyclist: [[['W', 'S'], 'Pedal / Brake'], [['A', 'D'], 'Lean & Turn'], [['Shift'], 'Sprint'], [['Drag'], 'Orbit']],
     helicopter: [[['W', 'S'], 'Pitch'], [['A', 'D'], 'Yaw'], [['Space', 'E'], 'Ascend'], [['Q', 'C'], 'Descend'], [['Shift'], 'Boost']]
   };

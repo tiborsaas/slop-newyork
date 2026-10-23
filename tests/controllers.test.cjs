@@ -208,7 +208,7 @@ function teleportHarness(mode, colliders = [], shore = () => ({ westX: -500, eas
     type: mode, chaseDistance: chase[mode][0], chaseHeight: chase[mode][1],
     position: position(400, mode === 'helicopter' ? 120 : 0, 400), heading: 1, speed: 20,
     mesh: pivot(),
-    verticalVel: 5, vx: 3, vz: -4, angularVel: 2, steerAngle: 0.4,
+    verticalVel: 5, vx: 3, vz: -4, angularVel: 2, steerAngle: 0.4, rearGripLoss: 1,
     pitchVel: 3, rollVel: 4, heaveY: 0.1, heaveVel: 2, chassisPivot: pivot(),
     lastCollisionSpark: { speed: 5 }, carState: { value: { x: 0 } }, wheelSpin: 1,
     wheels: [{ isFront: true, steerPivot: { rotation: { y: 0.4 } }, tire: { rotation: { x: 0 } } }],
@@ -247,7 +247,7 @@ for (const mode of ['person', 'car', 'cyclist', 'helicopter']) {
       assert.deepEqual(ent.rig.resetArgs.slice(0, 3), [30, 20, 0.7]);
       assert.equal(ent.rig.resetArgs[3](ent.rig.resetArgs[4], 30, 20), 0.22);
     } else if (mode === 'car') {
-      for (const field of ['vx', 'vz', 'angularVel', 'steerAngle', 'pitchVel', 'rollVel', 'heaveY', 'heaveVel']) assert.equal(ent[field], 0, field);
+      for (const field of ['vx', 'vz', 'angularVel', 'steerAngle', 'rearGripLoss', 'pitchVel', 'rollVel', 'heaveY', 'heaveVel']) assert.equal(ent[field], 0, field);
       assert.equal(ent.chassisPivot.rotation.x, 0);
       assert.equal(ent.chassisPivot.rotation.z, 0);
       assert.equal(ent.chassisPivot.position.y, 0);
@@ -375,4 +375,64 @@ test('player clearance respects altitude and permits a ground arrival under an a
   assert.equal(ent.position.y, 0.22);
   helicopter.position.y = 1;
   assert.notDeepEqual({ ...controller.teleportActiveTo(0, 0) }, { x: 0, z: 0 }, 'a helicopter parked at street level must be avoided');
+});
+
+test('Space engages the car handbrake, slows the rear tyres, and induces recoverable rear drift when steering', () => {
+  const normal = teleportHarness('car');
+  const braked = teleportHarness('car');
+  for (const h of [normal, braked]) {
+    h.controller.teleportActiveTo(0, 0, 0);
+    h.ent.speed = 20;
+    h.ent.carState.value.x = 0;
+  }
+
+  normal.key('keydown', 'KeyE');
+  assert.equal(normal.controller.keys.up, true);
+  assert.equal(normal.controller.keys.handbrake, false, 'helicopter ascend alias E must not engage the car handbrake');
+  normal.key('keyup', 'KeyE');
+
+  braked.key('keydown', 'Space');
+  assert.equal(braked.controller.keys.handbrake, true);
+  assert.equal(braked.controller.keys.up, true, 'Space still drives jump and ascend in other modes');
+
+  normal.controller.updateCar(0.1);
+  braked.controller.updateCar(0.1);
+  assert.ok(braked.ent.speed < normal.ent.speed - 0.5, 'rear handbrake rolling resistance decelerates the car');
+  assert.equal(braked.ent.rearGripLoss, 1);
+  assert.equal(braked.ent.carState.value.x, 1, 'handbrake illuminates the brake lights');
+  assert.equal(normal.ent.carState.value.x, 0);
+
+  // Steer into a left turn at speed with and without the handbrake held.
+  const gripTurn = teleportHarness('car');
+  const driftTurn = teleportHarness('car');
+  for (const h of [gripTurn, driftTurn]) {
+    h.controller.teleportActiveTo(0, 0, 0);
+    h.ent.speed = 20;
+    h.key('keydown', 'KeyW');
+    h.key('keydown', 'KeyA');
+  }
+  driftTurn.key('keydown', 'Space');
+
+  for (let i = 0; i < 20; i++) {
+    gripTurn.controller.updateCar(1 / 60);
+    driftTurn.controller.updateCar(1 / 60);
+  }
+  const gripSlip = Math.hypot(gripTurn.ent.vx, gripTurn.ent.vz);
+  const driftSlip = Math.hypot(driftTurn.ent.vx, driftTurn.ent.vz);
+  assert.equal(gripSlip, 0, 'normal cornering keeps full rear lateral grip');
+  assert.ok(driftSlip > 4, 'rear grip loss transfers momentum into lateral slide');
+  assert.ok(driftTurn.ent.angularVel > 1, 'front tyre lateral force overpowers the sliding rear tyres to yaw the car');
+  assert.ok(driftTurn.ent.heading > gripTurn.ent.heading, 'handbrake oversteer rotates the nose faster into the turn');
+
+  // Releasing Space recovers rear grip linearly over gripRecoveryTime (0.15 s) and damps the slide.
+  driftTurn.key('keyup', 'Space');
+  driftTurn.key('keyup', 'KeyA');
+  driftTurn.controller.updateCar(0.075);
+  assert.ok(Math.abs(driftTurn.ent.rearGripLoss - 0.5) < 1e-9, 'half of rear grip recovers after 75 ms');
+  driftTurn.controller.updateCar(0.075);
+  assert.equal(driftTurn.ent.rearGripLoss, 0, 'rear grip is fully restored after 150 ms');
+
+  const slipAtRecovery = Math.hypot(driftTurn.ent.vx, driftTurn.ent.vz);
+  for (let i = 0; i < 30; i++) driftTurn.controller.updateCar(1 / 60);
+  assert.ok(Math.hypot(driftTurn.ent.vx, driftTurn.ent.vz) < slipAtRecovery * 0.1, 'restored rear grip straightens the slide');
 });
